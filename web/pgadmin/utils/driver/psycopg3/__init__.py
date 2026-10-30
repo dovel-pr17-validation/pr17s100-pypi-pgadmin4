@@ -1,0 +1,699 @@
+##########################################################################
+#
+# pgAdmin 4 - PostgreSQL Tools
+#
+# Copyright (C) 2013 - 2026, The pgAdmin Development Team
+# This software is released under the PostgreSQL Licence
+#
+##########################################################################
+
+"""
+Implementation of Driver class
+It is a wrapper around the actual psycopg3 driver, and connection
+object.
+
+"""
+import copy
+import datetime
+import re
+from flask import session
+from flask_babel import gettext
+from flask_login import current_user
+from sqlalchemy import inspect as sa_inspect
+from werkzeug.exceptions import InternalServerError
+import psycopg
+from threading import Lock
+
+import config
+from pgadmin.model import Server, SharedServer
+from pgadmin.utils.server_access import get_server, \
+    get_user_server_query
+from pgadmin.utils.exception import ObjectGone
+from pgadmin.utils import isolate_client_credential_files
+from pgadmin.utils.locker import ConnectionLocker, \
+    REQUIRE_AUTH_MIN_LIBPQ, apply_kerberos_conn_params, libpq_version
+from pgadmin.utils.passexec import build_passexec
+from .keywords import scan_keyword
+from ..abstract import BaseDriver
+from .connection import Connection
+from .server_manager import ServerManager
+
+connection_restore_lock = Lock()
+
+
+class Driver(BaseDriver):
+    """
+    class Driver(BaseDriver):
+
+    This driver acts as a wrapper around psycopg3 connection driver
+    implementation. We will be using psycopg3 for makeing connection with
+    the PostgreSQL/EDB Postgres Advanced Server (EnterpriseDB).
+
+    Properties:
+    ----------
+
+    * Version (string):
+        Version of psycopg3 driver
+
+    Methods:
+    -------
+    * get_connection(sid, database, conn_id, auto_reconnect)
+    - It returns a Connection class object, which may/may not be connected
+      to the database server for this sesssion
+
+    * release_connection(seid, database, conn_id)
+    - It releases the connection object for the given conn_id/database for this
+      session.
+
+    * connection_manager(sid, reset)
+    - It returns the server connection manager for this session.
+    """
+
+    def __init__(self, **kwargs):
+        self.managers = dict()
+
+        super(Driver, self).__init__()
+
+    def _restore_connections_from_session(self):
+        """
+        Used internally by connection_manager to restore connections
+        from sessions.  Includes both owned and shared servers so
+        non-owner connections survive session restore.
+        """
+        if session.sid not in self.managers:
+            self.managers[session.sid] = managers = dict()
+            if '__pgsql_server_managers' in session:
+                session_managers = \
+                    session['__pgsql_server_managers'].copy()
+                servers = get_user_server_query().filter(
+                    Server.is_adhoc == 0)
+                pga_user = self._current_pga_user()
+                for server in servers:
+                    server = self._manager_source(server)
+                    manager = managers[str(server.id)] = \
+                        ServerManager(server)
+                    manager.pga_user = pga_user
+                    if server.id in session_managers:
+                        saved = session_managers[server.id]
+                        if self._saved_state_is_stale(
+                                saved, server, pga_user):
+                            # The persisted blob was serialized under
+                            # this numeric id by whatever Server row
+                            # held it before (e.g. the configuration
+                            # database was reset or restored without
+                            # restarting pgAdmin), so it no longer
+                            # describes this row. Restoring it would
+                            # hand the new row the previous row's
+                            # password/connection state. The same goes
+                            # for state saved by a different pgAdmin
+                            # user on this browser session. Drop it and
+                            # let the manager start clean.
+                            manager.update_session()
+                        else:
+                            manager._restore(saved)
+                            manager.update_session()
+            return managers
+
+        return {}
+
+    @staticmethod
+    def _current_pga_user():
+        """
+        The fs_uniquifier of the logged-in pgAdmin user, which cached and
+        serialized ServerManager state is bound to. Unlike User.id it is
+        random, so it is not reused when the configuration database is
+        reset and a new user is created.
+        """
+        return getattr(current_user, 'fs_uniquifier', None)
+
+    @staticmethod
+    def _manager_source(server_data):
+        """
+        The Server a ServerManager for this server should be built from,
+        and compared against by _manager_is_stale and
+        _saved_state_is_stale.
+
+        For a non-owner of a shared server that is not the owner's row:
+        the connect endpoint builds the manager from the user's
+        SharedServer overlay (see
+        ServerModule.get_shared_server_properties), which replaces the
+        username, service, tunnel host, password and so on with the
+        user's own values. Building or comparing against the owner's row
+        instead would treat every such manager as stale and drop its
+        live connection on every request.
+
+        The overlay is applied to a transient copy of the row's columns,
+        so the session-bound instance other code may be holding is never
+        detached or modified. The SharedServer record is only read here,
+        never created; until the user has one (it is created when they
+        first connect), the row itself is returned.
+        """
+        if not (config.SERVER_MODE and server_data.shared and
+                server_data.user_id != current_user.id):
+            return server_data
+
+        shared_server = SharedServer.query.filter_by(
+            user_id=current_user.id, osid=server_data.id).first()
+        if shared_server is None:
+            return server_data
+
+        # Imported here, as the servers module imports this driver.
+        from pgadmin.browser.server_groups.servers import ServerModule
+
+        # Columns only: Server.clone() would also copy the servergroup
+        # relationship, which cascades the copy into the session. The
+        # values are deep-copied so the JSON columns (connection_params,
+        # tags) are not shared by reference with the session-bound row:
+        # MutableDict reports an in-place change to every parent it
+        # belongs to, so the overlay's edits would otherwise dirty the
+        # owner's row and be flushed by the next commit.
+        overlay = Server(**{
+            attr.key: copy.deepcopy(getattr(server_data, attr.key))
+            for attr in sa_inspect(Server).column_attrs
+        })
+        return ServerModule.get_shared_server_properties(
+            overlay, shared_server)
+
+    @staticmethod
+    def _effective_tunnel_host(server_data):
+        """
+        The tunnel host a ServerManager built from this row would carry.
+        ServerManager.update() ignores the row's tunnel columns when
+        SUPPORT_SSH_TUNNEL is off, so a row that still has a tunnel host
+        (imported, or saved before the setting was turned off) must be
+        compared against None rather than being reported stale forever.
+        """
+        return server_data.tunnel_host if config.SUPPORT_SSH_TUNNEL \
+            else None
+
+    @staticmethod
+    def _saved_state_is_stale(saved, server_data, pga_user=None):
+        """
+        Same identity check as _manager_is_stale, applied to the
+        serialized ServerManager state carried across worker
+        restarts/new sessions in the Flask session
+        ('__pgsql_server_managers'), before it is restored onto a
+        manager that was just built fresh from the current Server row.
+        Without this, a reused server id would have its old serialized
+        password/connections restored onto the new row on the very
+        first request, before any manager exists to run
+        _manager_is_stale against.
+
+        The state is also stale if it was saved by a different pgAdmin
+        user: nothing rotates the session id at login, so a new user
+        logging in on the same browser session must not inherit the
+        previous user's password or connections, even for a server with
+        identical connection details.
+        """
+        return (
+            saved.get('pga_user') != pga_user or
+            saved.get('host') != server_data.host or
+            saved.get('port') != server_data.port or
+            saved.get('db') != server_data.maintenance_db or
+            saved.get('user') != server_data.username or
+            saved.get('service') != server_data.service or
+            saved.get('tunnel_host') !=
+            Driver._effective_tunnel_host(server_data)
+        )
+
+    @staticmethod
+    def _manager_is_stale(manager, server_data, pga_user=None):
+        """
+        A cached manager is normally kept in sync with edits to its
+        Server row via explicit manager.update() calls from the
+        server-edit endpoints. It can still go stale in place if the
+        row itself was swapped out from under it, e.g. a numeric
+        server id reused by an unrelated row after the configuration
+        database was reset or restored without restarting pgAdmin, so
+        compare against what actually identifies the target rather
+        than trusting the id match alone. It is also stale if it was
+        built for a different pgAdmin user on the same browser session
+        (see _saved_state_is_stale).
+        """
+        return (
+            getattr(manager, 'pga_user', None) != pga_user or
+            manager.host != server_data.host or
+            manager.port != server_data.port or
+            manager.db != server_data.maintenance_db or
+            manager.user != server_data.username or
+            manager.service != server_data.service or
+            manager.tunnel_host != Driver._effective_tunnel_host(server_data)
+        )
+
+    def connection_manager(self, sid=None):
+        """
+        connection_manager(...)
+
+        Returns the ServerManager object for the current session. It will
+        create new ServerManager object (if necessary).
+
+        Parameters:
+            sid
+            - Server ID
+        """
+        assert (sid is not None and isinstance(sid, int))
+        managers = None
+
+        # In server mode, verify the current user has access to this
+        # server. This is the primary security boundary — all
+        # check_precondition decorators and tool endpoints flow
+        # through connection_manager().
+        if config.SERVER_MODE:
+            if current_user and current_user.is_authenticated:
+                server_data = get_server(sid)
+            else:
+                raise ObjectGone(
+                    gettext("Server not found."))
+            if server_data is None:
+                raise ObjectGone(
+                    gettext("Server not found."))
+        else:
+            # Desktop mode — single user, no isolation needed.
+            # Return None instead of raising so callers that
+            # handle None gracefully (e.g., test teardown,
+            # cleanup paths) are not disrupted.
+            server_data = Server.query.filter_by(id=sid).first()
+            if server_data is None:
+                return None
+
+        if session.sid not in self.managers:
+            with connection_restore_lock:
+                # The wait is over but the object might have been loaded
+                # by some other thread check again
+                managers = self._restore_connections_from_session()
+        else:
+            managers = self.managers[session.sid]
+            if str(sid) in managers:
+                manager = managers[str(sid)]
+                pga_user = self._current_pga_user()
+                manager_source = self._manager_source(server_data)
+                with connection_restore_lock:
+                    if self._manager_is_stale(
+                            manager, manager_source, pga_user):
+                        # The id has been reused by an unrelated Server
+                        # row (e.g. the configuration database was reset
+                        # or restored without restarting pgAdmin), so the
+                        # cached manager still points at whatever server
+                        # it was originally built from. Drop it rather
+                        # than report a live connection to a server that,
+                        # from this row's perspective, was never opened.
+                        # The same applies to a manager built for another
+                        # pgAdmin user on this browser session.
+                        manager.release()
+                        manager.update(manager_source)
+                        manager.pga_user = pga_user
+                    else:
+                        manager._restore_connections()
+                        manager.update_session()
+                        # Identity (host/port/db/user/service/tunnel)
+                        # still matches, so the live connection is kept,
+                        # but access-control-relevant metadata such as
+                        # shared/ownership is not part of that identity
+                        # check and manager.update() was skipped above -
+                        # refresh it here too, otherwise a row whose
+                        # sharing/ownership changed via the same reused-id
+                        # path could keep serving the previous owner's
+                        # passexec to a new, non-owning user. The password
+                        # exec command is only rebuilt when sharing
+                        # changes, so its cached password survives
+                        # ordinary requests.
+                        if manager.shared != server_data.shared:
+                            manager.shared = server_data.shared
+                            manager.passexec = build_passexec(
+                                manager_source)
+
+        managers['pinged'] = datetime.datetime.now()
+        # The session is active again, so gc_timeout() should run the
+        # session GC callbacks the next time it goes idle.
+        managers.pop('gc_callbacks_run', None)
+        if str(sid) not in managers:
+            # server_data was already access-checked above;
+            # it cannot be None at this point.
+            manager = ServerManager(self._manager_source(server_data))
+            manager.pga_user = self._current_pga_user()
+            managers[str(sid)] = manager
+
+            return manager
+
+        return managers[str(sid)]
+
+    def version(self):
+        """
+        version(...)
+
+        Returns the current version of psycopg3 driver
+        """
+        _version = getattr(psycopg, '__version__', None)
+
+        if _version:
+            return _version
+
+        raise InternalServerError(
+            "Driver Version information for psycopg3 is not available!"
+        )
+
+    def libpq_version(self):
+        """
+        Returns the loaded libpq version
+        """
+        version = getattr(psycopg, '__libpq_version__', None)
+        if version:
+            return version
+
+        raise InternalServerError(
+            "libpq version information is not available!"
+        )
+
+    def get_connection(
+            self, sid, database=None, conn_id=None, auto_reconnect=True,
+            **kwargs
+    ):
+        """
+        get_connection(...)
+
+        Returns the connection object for the certain connection-id/database
+        for the specific server, identified by sid. Create a new Connection
+        object (if require). If server id is 0, it will return the database
+        connection object.
+
+        Parameters:
+            sid
+            - Server ID
+            database
+            - Database, on which the connection needs to be made
+              If provided none, maintenance_db for the server will be used,
+              while generating new Connection object.
+            conn_id
+            - Identification String for the Connection This will be used by
+              certain tools, which will require a dedicated connection for it.
+              i.e. Debugger, Query Tool, etc.
+            auto_reconnect
+            - This parameters define, if we should attempt to reconnect the
+              database server automatically, when connection has been lost for
+              any reason. Certain tools like Debugger will require a permenant
+              connection, and it stops working on disconnection.
+
+        """
+
+        if sid:
+            manager = self.connection_manager(sid)
+
+            return manager.connection(database=database, conn_id=conn_id,
+                                      auto_reconnect=auto_reconnect)
+        else:
+            params = dict(
+                host=kwargs['host'],
+                dbname=database,
+                user=kwargs['user'],
+                password=kwargs[
+                    'password'] if 'password' in kwargs else None,
+                port=kwargs['port'] if
+                kwargs['port'] else None,
+                passfile=kwargs['passfile'],
+                connect_timeout=kwargs['connect_timeout'] if
+                'connect_timeout' in kwargs and
+                kwargs['connect_timeout'] else 0,
+                sslmode=kwargs['sslmode'],
+                sslcert=kwargs['sslcert'],
+                sslkey=kwargs['sslkey'],
+                sslrootcert=kwargs['sslrootcert'],
+                sslcompression=True if kwargs[
+                    'sslcompression'] else False
+            )
+            # This connection never uses Kerberos, so libpq is told to
+            # refuse it.
+            apply_kerberos_conn_params(params, is_kerberos_conn=False)
+            params = isolate_client_credential_files(params)
+            if libpq_version() >= REQUIRE_AUTH_MIN_LIBPQ:
+                # GSSAPI and SSPI are refused before any credentials are
+                # used, so there is nothing for the lock to guard.
+                return psycopg.Connection.connect(**params)
+
+            # Under the lock, so that pgAdmin's environment does not hold
+            # another user's Kerberos credential cache meanwhile.
+            with ConnectionLocker():
+                return psycopg.Connection.connect(**params)
+
+    def release_connection(self, sid, database=None, conn_id=None):
+        """
+        Release the connection for the given connection-id/database in this
+        session.
+        """
+        return self.connection_manager(sid).release(database, conn_id)
+
+    def rebind_session_managers(self, old_pga_user, new_pga_user):
+        """
+        Re-tag this browser session's connection managers after the
+        logged-in user's fs_uniquifier has been rotated (a password change),
+        so that _manager_is_stale/_saved_state_is_stale do not drop the
+        session's live connections. Only state built for old_pga_user is
+        re-tagged, so another user's state on this session stays stale.
+        Other sessions keep the old uniquifier, as they are being revoked.
+        """
+        if not old_pga_user or old_pga_user == new_pga_user:
+            return
+
+        for manager in self.managers.get(session.sid, {}).values():
+            if getattr(manager, 'pga_user', None) == old_pga_user:
+                manager.pga_user = new_pga_user
+
+        saved_managers = session.get('__pgsql_server_managers')
+        if saved_managers:
+            for saved in saved_managers.values():
+                if isinstance(saved, dict) and \
+                        saved.get('pga_user') == old_pga_user:
+                    saved['pga_user'] = new_pga_user
+            session['__pgsql_server_managers'] = saved_managers
+            session.force_write = True
+
+    def delete_manager(self, sid):
+        """
+        Delete manager for given server id.
+        """
+        manager = self.connection_manager(sid)
+        if manager is not None:
+            manager.release()
+        if session.sid in self.managers and \
+                str(sid) in self.managers[session.sid]:
+            del self.managers[session.sid][str(sid)]
+
+    def gc_timeout(self):
+        """
+        Release the connections for the sessions, which have not pinged the
+        server for more than config.MAX_SESSION_IDLE_TIME.
+        """
+
+        # Minimum session idle is 20 minutes
+        max_idle_time = max(config.MAX_SESSION_IDLE_TIME or 60, 20)
+        session_idle_timeout = datetime.timedelta(minutes=max_idle_time)
+
+        curr_time = datetime.datetime.now()
+
+        for sess in self.managers:
+            sess_mgr = self.managers[sess]
+
+            if sess == session.sid:
+                sess_mgr['pinged'] = curr_time
+                sess_mgr.pop('gc_callbacks_run', None)
+                continue
+            if curr_time - sess_mgr['pinged'] >= session_idle_timeout:
+                for mgr in [
+                    m for m in sess_mgr.values() if isinstance(m,
+                                                               ServerManager)
+                ]:
+                    mgr.release()
+                # Expired sessions stay in self.managers, so only run the
+                # callbacks once per idle period rather than on every sweep.
+                if not sess_mgr.get('gc_callbacks_run'):
+                    self.run_session_gc_callbacks(sess)
+                    sess_mgr['gc_callbacks_run'] = True
+
+    def gc_own(self):
+        """
+        Release the connections for current session
+        This is useful when (eg. logout) we want to release all
+        connections (except dedicated connections created by utilities
+        like backup, restore etc) of all servers for current user.
+        """
+
+        sess_mgr = self.managers.get(session.sid, None)
+
+        if sess_mgr:
+            for mgr in (
+                m for m in sess_mgr.values() if isinstance(m, ServerManager)
+            ):
+                mgr.release()
+
+    @staticmethod
+    def qtLiteral(value, conn, force_quote=False):
+        if not conn:
+            raise ValueError(
+                "qtLiteral requires a connection: without one, escaping "
+                "silently degrades to returning the raw value, which is a "
+                "SQL injection sink. When using the Jinja filter, ensure "
+                "render_template is called with conn=<conn>; when calling "
+                "from Python, pass the connection as the second argument."
+            )
+
+        # Resolve the underlying psycopg connection. A wrapped pgAdmin
+        # Connection has the raw psycopg connection on `.conn`.
+        if not isinstance(conn, psycopg.Connection) and \
+                not isinstance(conn, psycopg.AsyncConnection):
+            conn = conn.conn
+
+        # psycopg.sql.Literal.as_string can raise for values it cannot
+        # adapt (custom types without a registered adapter, byte
+        # sequences in a non-UTF8 client encoding, etc.). The previous
+        # implementation swallowed the exception and silently returned
+        # the raw, unescaped `value` — the same SQL-injection sink the
+        # missing-conn fast-fail above guards against, but on a
+        # different failure mode. Letting the exception propagate makes
+        # any unadaptable input loud and callers can react explicitly.
+        res = psycopg.sql.Literal(value).as_string(conn).strip()
+
+        if force_quote is True:
+            # Convert the input to the string to use the startsWith(...)
+            res = str(res)
+            if not res.startswith("'"):
+                return "'" + res + "'"
+
+        return res
+
+    @staticmethod
+    def ScanKeywordExtraLookup(key):
+        # UNRESERVED_KEYWORD      0
+        # COL_NAME_KEYWORD        1
+        # TYPE_FUNC_NAME_KEYWORD  2
+        # RESERVED_KEYWORD        3
+        extra_keywords = {
+            'connect': 3,
+            'convert': 3,
+            'distributed': 0,
+            'exec': 3,
+            'log': 0,
+            'long': 3,
+            'minus': 3,
+            'nocache': 3,
+            'number': 3,
+            'package': 3,
+            'pls_integer': 3,
+            'raw': 3,
+            'return': 3,
+            'smalldatetime': 3,
+            'smallfloat': 3,
+            'smallmoney': 3,
+            'sysdate': 3,
+            'systimestap': 3,
+            'tinyint': 3,
+            'tinytext': 3,
+            'varchar2': 3
+        }
+
+        return extra_keywords.get(key, None) or scan_keyword(key)
+
+    @staticmethod
+    def needsQuoting(key, for_types):
+        value = key
+        val_noarray = value
+
+        # check if the string is number or not
+        if isinstance(value, int):
+            return True
+        # certain types should not be quoted even though it contains a space.
+        # Evilness.
+        elif for_types and value.endswith('[]'):
+            val_noarray = value[:-2]
+
+        if for_types and val_noarray.lower() in [
+            'bit varying',
+            '"char"',
+            'character varying',
+            'double precision',
+            'timestamp without time zone',
+            'timestamp with time zone',
+            'time without time zone',
+            'time with time zone',
+            '"trigger"',
+            '"unknown"'
+        ]:
+            return False
+
+        # If already quoted?, If yes then do not quote again
+        if for_types and val_noarray and \
+                (val_noarray.startswith('"') or val_noarray.endswith('"')):
+            return False
+
+        if '0' <= val_noarray[0] <= '9':
+            return True
+
+        if re.search('[^a-z_0-9]+', val_noarray):
+            return True
+
+        # check string is keywaord or not
+        category = Driver.ScanKeywordExtraLookup(value)
+
+        if category is None:
+            return False
+
+        # UNRESERVED_KEYWORD
+        if category == 0:
+            return False
+
+        # COL_NAME_KEYWORD
+        if for_types and category == 1:
+            return False
+
+        return True
+
+    @staticmethod
+    def qtTypeIdent(conn, *args):
+        # We're not using the conn object at the moment, but - we will
+        # modify the
+        # logic to use the server version specific keywords later.
+        res = None
+        value = None
+
+        for val in args:
+            # DataType doesn't have len function then convert it to string
+            if not hasattr(val, '__len__'):
+                val = str(val)
+
+            if len(val) == 0:
+                continue
+            value = val
+
+            if Driver.needsQuoting(val, True):
+                value = value.replace("\"", "\"\"")
+                value = "\"" + value + "\""
+
+            res = ((res and res + '.') or '') + value
+
+        return res
+
+    @staticmethod
+    def qtIdent(conn, *args):
+        # We're not using the conn object at the moment, but - we will
+        # modify the logic to use the server version specific keywords later.
+        res = None
+        value = None
+
+        for val in args:
+            if isinstance(val, list):
+                return map(lambda w: Driver.qtIdent(conn, w), val)
+
+            # DataType doesn't have len function then convert it to string
+            if not hasattr(val, '__len__'):
+                val = str(val)
+
+            if len(val) == 0:
+                continue
+
+            value = val
+
+            if Driver.needsQuoting(val, False):
+                value = value.replace("\"", "\"\"")
+                value = "\"" + value + "\""
+
+            res = ((res and res + '.') or '') + value
+
+        return res

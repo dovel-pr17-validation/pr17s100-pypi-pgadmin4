@@ -1,0 +1,267 @@
+/////////////////////////////////////////////////////////////
+//
+// pgAdmin 4 - PostgreSQL Tools
+//
+// Copyright (C) 2013 - 2026, The pgAdmin Development Team
+// This software is released under the PostgreSQL Licence
+//
+//////////////////////////////////////////////////////////////
+
+
+import _ from 'lodash';
+import pgAdmin from 'sources/pgadmin';
+import current_user from 'pgadmin.user_management.current_user';
+import ServerSchema, { passexecForServerCopy, sharingForServerCopy, starfleetConnectionParams } from '../../../pgadmin/browser/server_groups/servers/static/js/server.ui';
+import {genericBeforeEach, getCreateView, getEditView, getPropertiesView} from '../genericFunctions';
+
+describe('ServerSchema', ()=>{
+
+  const createSchemaObject = () => new ServerSchema([{
+    label: 'Servers', value: 1,
+  }], 0, {
+    user_id: 'jasmine',
+  });
+  let schemaObj = createSchemaObject();
+  let getInitData = ()=>Promise.resolve({});
+
+  beforeEach(()=>{
+    genericBeforeEach();
+    pgAdmin.Browser.utils.support_ssh_tunnel = true;
+  });
+
+  it('create', async ()=>{
+    await getCreateView(createSchemaObject());
+  });
+
+  it('edit', async ()=>{
+    await getEditView(createSchemaObject(), getInitData);
+  });
+
+  it('properties', async ()=>{
+    await getPropertiesView(createSchemaObject(), getInitData);
+  });
+
+  it('validate', ()=>{
+    let state = {};
+    let setError = jest.fn();
+
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('gid', 'Server group must be specified.');
+
+    state.gid = 1;
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('host', 'Either Host name or Service must be specified.');
+
+    state.host = '127.0.0.1';
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('username', 'Username must be specified.');
+
+    state.username = 'postgres';
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('port', 'Port must be specified.');
+
+    state.port = 5432;
+    state.use_ssh_tunnel = true;
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('tunnel_host', 'SSH Tunnel host must be specified.');
+
+    state.service = 'pgservice';
+    state.tunnel_host = 'localhost';
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('tunnel_port', 'SSH Tunnel port must be specified.');
+
+    state.tunnel_port = 8080;
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('tunnel_username', 'SSH Tunnel username must be specified.');
+
+    state.tunnel_username = 'jasmine';
+    state.tunnel_authentication = true;
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('tunnel_identity_file', 'SSH Tunnel identity file must be specified.');
+
+    state.tunnel_identity_file = '/file/path/xyz.pem';
+    schemaObj.validate(state, setError);
+    expect(setError).toHaveBeenCalledWith('tunnel_keep_alive', 'Keep alive must be specified. Specify 0 for no keep alive.');
+
+    state.tunnel_keep_alive = 0;
+    expect(schemaObj.validate(state, setError)).toBe(false);
+  });
+
+  describe('password exec command', ()=>{
+    let origMode, origCommands, origUserId;
+    const field = (schema, id) => _.find(schema.fields, (f)=>f.id==id);
+    const setup = (serverMode, commands) => {
+      pgAdmin.server_mode = serverMode;
+      pgAdmin.server_passexec_commands = commands;
+      return createSchemaObject();
+    };
+
+    beforeEach(()=>{
+      origMode = pgAdmin.server_mode;
+      origCommands = pgAdmin.server_passexec_commands;
+      origUserId = current_user.id;
+    });
+
+    afterEach(()=>{
+      pgAdmin.server_mode = origMode;
+      pgAdmin.server_passexec_commands = origCommands;
+      current_user.id = origUserId;
+    });
+
+    it('offers None and the configured names to an owner', ()=>{
+      let schema = setup('True', ['vault']);
+      let f = field(schema, 'passexec_name');
+      expect(f.mode).toEqual(['properties', 'edit', 'create']);
+      expect(f.visible({})).toBe(true);
+      let type = f.type({id: 1, shared: false});
+      expect(type.type).toBe('select');
+      expect(type.options).toEqual([
+        {label: 'None', value: '__none__'},
+        {label: 'vault', value: 'vault'},
+      ]);
+      expect(field(schema, 'passexec_cmd').visible({})).toBe(false);
+    });
+
+    it('offers Inherit from owner to a non-owner of a shared server', ()=>{
+      let schema = setup('True', ['vault']);
+      current_user.id = 2;
+      schema.userId = 1;
+      let type = field(schema, 'passexec_name').type({id: 5, shared: true});
+      expect(type.options).toEqual([
+        {label: 'Inherit from owner', value: '__inherit__'},
+        {label: 'None', value: '__none__'},
+        {label: 'vault', value: 'vault'},
+      ]);
+    });
+
+    it('does not offer Inherit to the owner of a shared server', ()=>{
+      let schema = setup('True', ['vault']);
+      current_user.id = 1;
+      schema.userId = 1;
+      let type = field(schema, 'passexec_name').type({id: 5, shared: true});
+      expect(type.options.map((o)=>o.value)).toEqual(['__none__', 'vault']);
+    });
+
+    it('hides the select when no commands are configured', ()=>{
+      let schema = setup('True', []);
+      expect(field(schema, 'passexec_name').visible({})).toBe(false);
+      expect(field(schema, 'passexec_cmd').visible({})).toBe(false);
+      expect(field(schema, 'passexec_expiration').visible({})).toBe(false);
+    });
+
+    it('shows the expiration in server mode when commands are configured', ()=>{
+      let schema = setup('True', ['vault']);
+      expect(field(schema, 'passexec_expiration').visible({})).toBe(true);
+    });
+
+    it('shows the free text command only in desktop mode', ()=>{
+      let schema = setup('False', []);
+      expect(field(schema, 'passexec_cmd').visible({})).toBe(true);
+      expect(field(schema, 'passexec_name').visible({})).toBe(false);
+      expect(field(schema, 'passexec_expiration').visible({})).toBe(true);
+    });
+
+    it('disables the expiration according to the mode', ()=>{
+      let schema = setup('True', ['vault']);
+      let disabled = field(schema, 'passexec_expiration').disabled;
+      expect(disabled({passexec_name: '__none__'})).toBe(true);
+      expect(disabled({passexec_name: '__inherit__'})).toBe(true);
+      expect(disabled({passexec_name: 'vault'})).toBe(false);
+
+      schema = setup('False', []);
+      disabled = field(schema, 'passexec_expiration').disabled;
+      expect(disabled({passexec_cmd: ''})).toBe(true);
+      expect(disabled({passexec_cmd: 'echo x'})).toBe(false);
+    });
+
+    it('defaults to None in server mode', ()=>{
+      expect(setup('True', ['vault']).defaults.passexec_name).toBe('__none__');
+      expect(setup('False', []).defaults.passexec_name).toBeUndefined();
+    });
+
+    it('turns an inherited command into none when copying a shared server', ()=>{
+      let d = {name: 'x', passexec_name: '__inherit__', passexec_cmd: 'echo x'};
+      expect(passexecForServerCopy(d)).toBe(d);
+      expect(d.passexec_name).toBe('__none__');
+      expect(d).not.toHaveProperty('passexec_cmd');
+    });
+
+    it('keeps a named or none command when copying a shared server', ()=>{
+      expect(passexecForServerCopy({passexec_name: 'vault'}).passexec_name)
+        .toBe('vault');
+      expect(passexecForServerCopy({passexec_name: '__none__'}).passexec_name)
+        .toBe('__none__');
+    });
+  });
+
+  describe('pgEdge Starfleet hosts', ()=>{
+    const defaults = [
+      {'name': 'sslmode', 'value': 'prefer', 'keyword': 'sslmode'},
+      {'name': 'connect_timeout', 'value': 10, 'keyword': 'connect_timeout'}];
+    const hostField = (schema)=>_.find(schema.fields, (f)=>f.id=='host');
+
+    it('requires SSL in place of the default prefer', ()=>{
+      expect(starfleetConnectionParams('db-1.use2.pgedge.cloud', defaults))
+        .toEqual([
+          {'name': 'sslmode', 'value': 'require', 'keyword': 'sslmode'},
+          defaults[1]]);
+    });
+
+    it('adds sslmode when it has been removed', ()=>{
+      expect(starfleetConnectionParams('DB-1.USE2.PGEDGE.CLOUD.', [defaults[1]]))
+        .toEqual([
+          {'name': 'sslmode', 'value': 'require', 'keyword': 'sslmode'},
+          defaults[1]]);
+    });
+
+    it('keeps an sslmode the user chose', ()=>{
+      expect(starfleetConnectionParams('db-1.use2.pgedge.cloud', [
+        {'name': 'sslmode', 'value': 'verify-full', 'keyword': 'sslmode'},
+      ])).toBeUndefined();
+    });
+
+    it('leaves other hosts alone', ()=>{
+      expect(starfleetConnectionParams('db.example.com', defaults)).toBeUndefined();
+      expect(starfleetConnectionParams('pgedge.cloud.example.com', defaults)).toBeUndefined();
+      expect(starfleetConnectionParams('', defaults)).toBeUndefined();
+    });
+
+    it('applies only to a new server', ()=>{
+      let schema = createSchemaObject();
+      let f = hostField(schema);
+      expect(f.depChange({host: 'db-1.use2.pgedge.cloud', connection_params: defaults}))
+        .toEqual({connection_params: [
+          {'name': 'sslmode', 'value': 'require', 'keyword': 'sslmode'},
+          defaults[1]]});
+      expect(f.depChange({id: 1, host: 'db-1.use2.pgedge.cloud', connection_params: defaults}))
+        .toBeUndefined();
+    });
+  });
+
+  describe('sharingForServerCopy', ()=>{
+    it('clears the sharing of a copy made by a non-admin', ()=>{
+      let d = {name: 'x', shared: true, shared_username: 'someone'};
+      expect(sharingForServerCopy(d, {is_admin: false})).toBe(d);
+      expect(d.shared).toBe(false);
+      expect(d.shared_username).toBeNull();
+
+      d = {shared: true, shared_username: 'someone'};
+      sharingForServerCopy(d, undefined);
+      expect(d.shared).toBe(false);
+      expect(d.shared_username).toBeNull();
+    });
+
+    it('keeps the sharing of a copy made by an admin', ()=>{
+      let d = {name: 'x', shared: true, shared_username: 'someone'};
+      expect(sharingForServerCopy(d, {is_admin: true})).toBe(d);
+      expect(d.shared).toBe(true);
+      expect(d.shared_username).toBe('someone');
+    });
+
+    it('leaves a server that is not shared untouched', ()=>{
+      let d = {name: 'x', shared: false, shared_username: 'someone'};
+      sharingForServerCopy(d, {is_admin: false});
+      expect(d).toEqual({name: 'x', shared: false, shared_username: 'someone'});
+    });
+  });
+});

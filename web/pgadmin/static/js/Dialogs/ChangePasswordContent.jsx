@@ -1,0 +1,110 @@
+import React from 'react';
+import PropTypes from 'prop-types';
+import gettext from 'sources/gettext';
+import BaseUISchema from '../SchemaView/base_schema.ui';
+import SchemaView from '../SchemaView';
+
+export class ChangePasswordSchema extends BaseUISchema {
+  constructor(user, isPgpassFileUsed, hasCsrfToken=false, showUser=true,
+    warnSessionLogout=false) {
+    super({
+      user: user,
+      password: '',
+      newPassword: '',
+      confirmPassword: ''
+    });
+    this.isPgpassFileUsed = isPgpassFileUsed;
+    this.hasCsrfToken = hasCsrfToken;
+    this.showUser = showUser;
+    // Changing the pgAdmin login password rotates the session uniquifier,
+    // which signs the user out everywhere else. Warn them first (SchemaView
+    // turns warningText into a Yes/No confirm before the save goes through).
+    if (warnSessionLogout) {
+      this.warningText = gettext(
+        'Changing your password will log you out of all your other active '
+        + 'sessions. Do you want to continue?'
+      );
+    }
+  }
+
+  get baseFields() {
+    let self = this;
+    return [
+      {
+        id: 'user', label: gettext('User'), type: 'text', disabled: true, visible: this.showUser
+      }, {
+        id: 'password', label: gettext('Current Password'), type: 'password',
+        disabled: self.isPgpassFileUsed, noEmpty: !self.isPgpassFileUsed,
+        controlProps: {
+          maxLength: null,
+          autoComplete: 'new-password'
+        }
+      }, {
+        id: 'newPassword', label: gettext('New Password'), type: 'password',
+        noEmpty: true,
+        controlProps: {
+          maxLength: null
+        }
+      }, {
+        id: 'confirmPassword', label: gettext('Confirm Password'), type: 'password',
+        noEmpty: true,
+        controlProps: {
+          maxLength: null
+        }
+      }
+    ].concat(this.hasCsrfToken ? [
+      {
+        id: 'csrf_token', visible: false, type: 'text'
+      }
+    ]: []);
+  }
+
+  validate(state, setError) {
+    let errmsg = null;
+    if (state.newPassword !== state.confirmPassword) {
+      errmsg = gettext('Passwords do not match.');
+      setError('confirmPassword', errmsg);
+      return true;
+    } else {
+      setError('confirmPassword', null);
+    }
+
+    return false;
+  }
+}
+
+export default function ChangePasswordContent({getInitData=() => { /*This is intentional (SonarQube)*/ },
+  onSave, onClose, hasCsrfToken=false, showUser=true, userName='', isPgpassFileUsed=false,
+  warnSessionLogout=false}) {
+  const schema=React.useRef(null);
+  if (!schema.current)
+    schema.current = new ChangePasswordSchema(
+      userName, isPgpassFileUsed, hasCsrfToken, showUser, warnSessionLogout
+    );
+
+  return <SchemaView
+    formType={'dialog'}
+    getInitData={getInitData}
+    schema={schema.current}
+    viewHelperProps={{
+      mode: 'create',
+    }}
+    customSaveBtnName={gettext('Change')}
+    onSave={onSave}
+    onClose={onClose}
+    hasSQL={false}
+    disableSqlHelp={true}
+    disableDialogHelp={true}
+    isTabView={false}
+  />;
+}
+ChangePasswordContent.propTypes = {
+  onSave: PropTypes.func,
+  onClose: PropTypes.func,
+  getInitData: PropTypes.func,
+  hasCsrfToken: PropTypes.bool,
+  showUser: PropTypes.bool,
+  userName: PropTypes.string,
+  isPgpassFileUsed: PropTypes.bool,
+  warnSessionLogout: PropTypes.bool
+};

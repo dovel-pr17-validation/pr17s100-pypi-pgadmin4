@@ -1,0 +1,45 @@
+name: Check Python style
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - '**.py'
+      - '.pycodestyle'
+      - '.github/workflows/check-python-style.yml'
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - '**.py'
+      - '.pycodestyle'
+      - '.github/workflows/check-python-style.yml'
+
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  check-python-style:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python dependencies
+        run: |
+          sudo pip install --upgrade pip
+          sudo pip install pycodestyle
+
+      - name: Check the documentation
+        run: pycodestyle --config=.pycodestyle docs/
+
+      - name: Check the packaging
+        run: pycodestyle --config=.pycodestyle pkg/
+
+      - name: Check the application
+        run: pycodestyle --config=.pycodestyle web/
+
+      - name: Check the tools
+        run: pycodestyle --config=.pycodestyle tools/

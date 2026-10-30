@@ -1,0 +1,1257 @@
+##########################################################################
+#
+# pgAdmin 4 - PostgreSQL Tools
+#
+# Copyright (C) 2013 - 2026, The pgAdmin Development Team
+# This software is released under the PostgreSQL Licence
+#
+##########################################################################
+
+""" Implemented classes for the different object type used by data grid """
+
+from abc import ABCMeta, abstractmethod
+from collections import OrderedDict
+from flask import render_template, current_app
+from flask_babel import gettext
+from werkzeug.exceptions import InternalServerError
+from pgadmin.utils.ajax import forbidden
+from pgadmin.utils.driver import get_driver
+from pgadmin.tools.sqleditor.utils.is_query_resultset_updatable \
+    import is_query_resultset_updatable, _check_single_table
+from pgadmin.tools.sqleditor.utils.save_changed_data import save_changed_data
+from pgadmin.tools.sqleditor.utils.get_column_types import get_columns_types
+from pgadmin.utils.preferences import Preferences
+from pgadmin.utils.exception import ObjectGone, ExecuteError
+from pgadmin.utils.constants import SERVER_CONNECTION_CLOSED
+from config import PG_DEFAULT_DRIVER
+
+VIEW_FIRST_100_ROWS = 1
+VIEW_LAST_100_ROWS = 2
+VIEW_ALL_ROWS = 3
+VIEW_FILTERED_ROWS = 4
+
+
+class ObjectRegistry(ABCMeta):
+    """
+    class ObjectRegistry(ABCMeta)
+        Every object will be registered automatically by its object type.
+
+    Class-level Methods:
+    ----------- -------
+    * get_object(cls, name, **kwargs)
+      - This method returns the object based on register object type
+        else return not implemented error.
+    """
+
+    registry = dict()
+
+    def __init__(self, name, bases, d):
+        """
+        This method is used to register the objects based on object type.
+        """
+
+        if d and 'object_type' in d:
+            ObjectRegistry.registry[d['object_type']] = self
+
+        ABCMeta.__init__(self, name, bases, d)
+
+    @classmethod
+    def get_object(cls, name, **kwargs):
+        """
+        This method returns the object based on register object type
+        else return not implemented error
+
+        Args:
+            name: object type for which object to be returned.
+            **kwargs: N number of parameters
+        """
+
+        if name in ObjectRegistry.registry:
+            return (ObjectRegistry.registry[name])(**kwargs)
+
+        raise NotImplementedError(
+            gettext("This feature has not been implemented for object "
+                    "type '{0}'.").format(name)
+        )
+
+
+class BaseCommand(metaclass=ObjectRegistry):
+    """
+    class BaseCommand
+
+        It is a base class for SQL Tools like data grid and query tool.
+        A different sql tools must implement this to expose abstract methods.
+
+    Abstract Methods:
+    -------- -------
+    * get_sql()
+      - This method returns the proper SQL query for the object type.
+
+    * can_edit()
+      - This method returns True/False, specifying whether data is
+        editable or not.
+
+    * can_filter()
+      - This method returns True/False, specifying whether filter
+        will be applied on data or not.
+    """
+
+    def __init__(self, **kwargs):
+        """
+        This method is used to initialize the class and
+        create a proper object name which will be used
+        to fetch the data using namespace name and object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+
+        # Save the server group id, server id and database id, namespace id,
+        # object id
+        self.sgid = kwargs['sgid'] if 'sgid' in kwargs else None
+        self.sid = kwargs['sid'] if 'sid' in kwargs else None
+        self.did = kwargs['did'] if 'did' in kwargs else None
+
+    @abstractmethod
+    def get_sql(self):
+        pass
+
+    @abstractmethod
+    def can_edit(self):
+        pass
+
+    @abstractmethod
+    def can_filter(self):
+        pass
+
+    def can_insert(self):
+        """
+        Whether new rows may be added through the grid, assuming
+        can_edit() is True. Only views refuse this for now.
+        """
+        return True
+
+
+class SQLFilter():
+    """
+    class SQLFilter
+
+        Implementation of filter class for sql grid.
+
+    Class-level Methods:
+    ----------- -------
+    * get_filter()
+      - This method returns the filter applied.
+    * set_filter(row_filter)
+      - This method sets the filter to be applied.
+    * append_filter(row_filter)
+      - This method is used to append the filter within existing filter
+    * remove_filter()
+      - This method removes the filter applied.
+    * validate_filter(row_filter)
+      - This method validates the given filter.
+    * get_data_sorting()
+      - This method returns columns for data sorting
+    * set_data_sorting()
+      - This method saves columns for data sorting
+    """
+
+    def __init__(self, **kwargs):
+        """
+        This method is used to initialize the class and
+        create a proper object name which will be used
+        to fetch the data using namespace name and object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+        # Save the server id and database id, namespace id, object id
+        assert 'sid' in kwargs
+        assert 'did' in kwargs
+        assert 'obj_id' in kwargs
+
+        self.sid = kwargs['sid']
+        self.did = kwargs['did']
+        self.obj_id = kwargs['obj_id']
+        sql_filter = kwargs.get('sql_filter', None)
+        self._row_filter = sql_filter if isinstance(sql_filter, str) else None
+        self._data_sorting = kwargs.get('data_sorting', None)
+        self._set_sorting_from_filter_dialog = False
+
+        manager = get_driver(PG_DEFAULT_DRIVER).connection_manager(self.sid)
+        conn = manager.connection(did=self.did)
+
+        # we will set template path for sql scripts
+        self.sql_path = 'sqleditor/sql/#{0}#'.format(manager.version)
+
+        if conn.connected():
+            # Fetch the Namespace Name and object Name
+            query = render_template(
+                "/".join([self.sql_path, 'objectname.sql']),
+                obj_id=self.obj_id
+            )
+
+            status, result = conn.execute_dict(query)
+            if not status:
+                raise ExecuteError(result)
+            if len(result['rows']) == 0:
+                raise ObjectGone(
+                    gettext("The specified object could not be found."))
+
+            self.nsp_name = result['rows'][0]['nspname']
+            self.object_name = result['rows'][0]['relname']
+        else:
+            raise InternalServerError(SERVER_CONNECTION_CLOSED)
+
+    def get_filter(self):
+        """
+        This function returns the filter.
+        """
+        return self._row_filter
+
+    def set_filter(self, row_filter):
+        """
+        This function validates the filter and set the
+        given filter to member variable.
+
+        Args:
+            row_filter: sql query
+        """
+        if not isinstance(row_filter, str):
+            row_filter = None
+
+        status, msg = self.validate_filter(row_filter)
+
+        if status:
+            self._row_filter = row_filter
+
+        return status, msg
+
+    def get_data_sorting(self):
+        """
+        This function returns the filter.
+        """
+        if self._data_sorting and len(self._data_sorting) > 0:
+            return self._data_sorting
+        return None
+
+    def set_data_sorting(self, data_filter, set_from_filter_dialog=False):
+        """
+        This function validates the filter and set the
+        given filter to member variable.
+        """
+        self._data_sorting = data_filter['data_sorting']
+        self._set_sorting_from_filter_dialog = set_from_filter_dialog
+
+    def is_sorting_set_from_filter_dialog(self):
+        """This function return whether sorting is set from filter dialog"""
+        return self._set_sorting_from_filter_dialog
+
+    def is_filter_applied(self):
+        """
+        This function returns True if filter is applied else False.
+        """
+        is_filter_applied = True
+        if self._row_filter is None or self._row_filter == '':
+            is_filter_applied = False
+
+        if not is_filter_applied and \
+                self._data_sorting and len(self._data_sorting) > 0:
+            is_filter_applied = True
+
+        return is_filter_applied
+
+    def remove_filter(self):
+        """
+        This function remove the filter by setting value to None.
+        """
+        self._row_filter = None
+        self._data_sorting = None
+
+    def append_filter(self, row_filter):
+        """
+        This function will used to get the existing filter and append
+        the given filter.
+
+        Args:
+            row_filter: sql query to append
+        """
+
+        existing_filter = self.get_filter()
+
+        if existing_filter is None or existing_filter == '':
+            self._row_filter = row_filter
+        else:
+            self._row_filter = existing_filter + ' \n    AND ' + row_filter
+
+    def validate_filter(self, row_filter):
+        """
+        This function validates the given filter.
+
+        Args:
+            row_filter: sql syntax to validate
+        """
+        status = True
+        result = None
+
+        if row_filter is not None and row_filter != '':
+            manager = \
+                get_driver(PG_DEFAULT_DRIVER).connection_manager(self.sid)
+            conn = manager.connection(did=self.did)
+
+            if conn.connected():
+                sql = render_template(
+                    "/".join([self.sql_path, 'validate.sql']),
+                    nsp_name=self.nsp_name, object_name=self.object_name,
+                    row_filter=row_filter)
+
+                status, result = conn.execute_scalar(sql)
+                if not status:
+                    result = result.partition("\n")[0]
+
+        return status, result
+
+
+class FetchedRowTracker():
+    """
+    Keeps track of fetched row count.
+    """
+
+    def __init__(self, **kwargs):
+        self.fetched_rows = 0
+
+    def get_fetched_row_cnt(self):
+        return self.fetched_rows
+
+    def update_fetched_row_cnt(self, rows_cnt):
+        self.fetched_rows = rows_cnt
+
+
+class GridCommand(BaseCommand, SQLFilter, FetchedRowTracker):
+    """
+    class GridCommand()
+
+        It is a base class for different object type used by data grid.
+        A different object type must implement this to expose abstract methods.
+
+    Class-level Methods:
+    ----------- -------
+    * get_primary_keys()
+      - Derived class can implement there own logic to get the primary keys.
+
+    * save()
+      - Derived class can implement there own logic to save the data into the
+      database.
+
+    * set_limit(limit)
+      - This method sets the limit for SQL query
+
+    * get_limit()
+      - This method returns the limit.
+    """
+
+    def __init__(self, **kwargs):
+        """
+        This method is used to call base class init to initialize
+        the data.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+        BaseCommand.__init__(self, **kwargs)
+        SQLFilter.__init__(self, **kwargs)
+        FetchedRowTracker.__init__(self, **kwargs)
+
+        # Save the connection id, command type
+        self.conn_id = kwargs['conn_id'] if 'conn_id' in kwargs else None
+        self.cmd_type = kwargs['cmd_type'] if 'cmd_type' in kwargs else None
+        self.limit = -1
+        self._OBJECT_QUERY_SQL = 'objectquery.sql'
+
+        if self.cmd_type in (VIEW_FIRST_100_ROWS, VIEW_LAST_100_ROWS):
+            self.limit = 100
+        elif self.cmd_type == VIEW_ALL_ROWS:
+            # Apply the user-configurable default row limit (if any) for the
+            # "All Rows" option. A value of 0 (the default) means no limit,
+            # preserving the existing behaviour of fetching all rows.
+            default_row_limit = Preferences.module('sqleditor').preference(
+                'view_data_default_row_limit').get()
+            if default_row_limit and default_row_limit > 0:
+                self.limit = default_row_limit
+
+        self.thread_native_id = None
+        self.server_cursor = kwargs['server_cursor'] if\
+            'server_cursor' in kwargs else None
+
+    def get_primary_keys(self, *args, **kwargs):
+        return None, None
+
+    def get_all_columns_with_order(self):
+        """
+        Responsible for fetching columns from given object
+
+        Args:
+            default_conn: Connection object
+
+        Returns:
+            all_sorted_columns: Columns which are already sorted which will
+                         be used to populate the Grid in the dialog
+            all_columns: List of all the column for given object which will
+                         be used to fill columns options
+        """
+        all_sorted_columns = []
+        data_sorting = self.get_data_sorting()
+
+        # If user has custom data sorting then pass as it is.
+        if data_sorting and len(data_sorting) > 0:
+            all_sorted_columns = data_sorting
+
+        return all_sorted_columns
+
+    def save(self, changed_data, default_conn=None):
+        return forbidden(
+            errmsg=gettext("Data cannot be saved for the current object.")
+        )
+
+    def get_limit(self):
+        """
+        This function returns the limit for the SQL query.
+        """
+        return self.limit
+
+    def set_limit(self, limit):
+        """
+        This function sets the limit for the SQL query
+        Args:
+            limit: limit to be set for SQL.
+        """
+        self.limit = limit
+
+    def get_pk_order(self):
+        """
+        This function gets the order required for primary keys
+        """
+        if self.cmd_type == VIEW_LAST_100_ROWS:
+            return 'desc'
+        else:
+            return 'asc'
+
+    def get_thread_native_id(self):
+        return self.thread_native_id
+
+    def set_thread_native_id(self, thread_native_id):
+        self.thread_native_id = thread_native_id
+
+    def set_server_cursor(self, server_cursor):
+        self.server_cursor = server_cursor
+
+
+def _grid_columns_types(command_obj, conn):
+    """
+    Fetch column type/attribute info for the result of a TableCommand or
+    ViewCommand, resolved against the relation's own catalog entry.
+    """
+    columns_info = conn.get_column_info()
+    has_oids = command_obj.has_oids()
+    table_name = None
+    table_nspname = None
+    table_oid = _check_single_table(columns_info)
+    if table_oid is None:
+        table_name = command_obj.object_name
+        table_nspname = command_obj.nsp_name
+
+    return get_columns_types(conn=conn,
+                             columns_info=columns_info,
+                             has_oids=has_oids,
+                             table_oid=table_oid,
+                             is_query_tool=False,
+                             table_name=table_name,
+                             table_nspname=table_nspname,
+                             )
+
+
+class TableCommand(GridCommand):
+    """
+    class TableCommand(GridCommand)
+
+        It is a derived class for Table type.
+    """
+    object_type = 'table'
+
+    def __init__(self, **kwargs):
+        """
+        This method calls the __init__ method of the base class
+        to get the proper object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+
+        # call base class init to fetch the table name
+        super().__init__(**kwargs)
+
+        # Set the default sorting on table data by primary key if user
+        # preference value is set
+        self.data_sorting_by_pk = Preferences.module('sqleditor').preference(
+            'table_view_data_by_pk').get()
+
+    def get_sql(self, default_conn=None):
+        """
+        This method is used to create a proper SQL query
+        to fetch the data for the specified table
+        """
+
+        # Fetch the primary keys for the table
+        _, primary_keys = self.get_primary_keys(default_conn)
+
+        # Fetch OIDs status
+        has_oids = self.has_oids(default_conn)
+
+        sql_filter = self.get_filter()
+        data_sorting = self.get_data_sorting()
+
+        # If data sorting is none and not reset from the filter dialog then
+        # set the data sorting in following conditions:
+        #   1. When command type is VIEW_FIRST_100_ROWS or VIEW_LAST_100_ROWS.
+        #   2. When command type is VIEW_ALL_ROWS and limit is greater than 0
+
+        if data_sorting is None and \
+            not self.is_sorting_set_from_filter_dialog() \
+            and (self.cmd_type in (VIEW_FIRST_100_ROWS, VIEW_LAST_100_ROWS) or
+                 (self.cmd_type == VIEW_ALL_ROWS and self.data_sorting_by_pk)):
+            sorting = {'data_sorting': []}
+            for pk in primary_keys:
+                sorting['data_sorting'].append(
+                    {'name': pk, 'order': self.get_pk_order()})
+            self.set_data_sorting(sorting)
+            data_sorting = self.get_data_sorting()
+
+        if sql_filter is None:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name,
+                nsp_name=self.nsp_name, limit=self.limit, has_oids=has_oids,
+                data_sorting=data_sorting
+            )
+        else:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name,
+                nsp_name=self.nsp_name, limit=self.limit, has_oids=has_oids,
+                sql_filter=sql_filter, data_sorting=data_sorting
+            )
+
+        return sql
+
+    def get_primary_keys(self, default_conn=None):
+        """
+        This function is used to fetch the primary key columns.
+        """
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        if default_conn is None:
+            manager = driver.connection_manager(self.sid)
+            conn = manager.connection(did=self.did, conn_id=self.conn_id)
+        else:
+            conn = default_conn
+
+        pk_names = ''
+        primary_keys = OrderedDict()
+
+        if conn.connected():
+
+            # Fetch the primary key column names
+            query = render_template(
+                "/".join([self.sql_path, 'primary_keys.sql']),
+                table_name=self.object_name,
+                table_nspname=self.nsp_name,
+                conn=conn,
+            )
+
+            status, result = conn.execute_dict(query)
+            if not status:
+                raise ExecuteError(result)
+
+            for row in result['rows']:
+                pk_names += driver.qtIdent(conn, row['attname']) + ','
+                primary_keys[row['attname']] = row['typname']
+
+            if pk_names != '':
+                # Remove last character from the string
+                pk_names = pk_names[:-1]
+        else:
+            raise InternalServerError(SERVER_CONNECTION_CLOSED)
+
+        return pk_names, primary_keys
+
+    def can_edit(self):
+        return True
+
+    def can_filter(self):
+        return True
+
+    def has_oids(self, default_conn=None):
+        """
+        This function checks whether the table has oids or not.
+        """
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        manager = driver.connection_manager(self.sid)
+
+        # Remove the special behavior of OID columns from
+        # PostgreSQL 12 onwards, so returning False.
+        if manager.sversion >= 120000:
+            return False
+
+        if default_conn is None:
+            conn = manager.connection(did=self.did, conn_id=self.conn_id)
+        else:
+            conn = default_conn
+
+        if conn.connected():
+
+            # Fetch the table oids status
+            query = render_template(
+                "/".join([self.sql_path, 'has_oids.sql']), obj_id=self.obj_id)
+
+            status, has_oids = conn.execute_scalar(query)
+            if not status:
+                raise ExecuteError(has_oids)
+
+        else:
+            raise InternalServerError(SERVER_CONNECTION_CLOSED)
+
+        return has_oids
+
+    def save(self,
+             changed_data,
+             columns_info,
+             client_primary_key='__temp_PK',
+             default_conn=None):
+        """
+        This function is used to save the data into the database.
+        Depending on condition it will either update or insert the
+        new row into the database.
+
+        Args:
+            changed_data: Contains data to be saved
+            columns_info:
+            default_conn:
+            client_primary_key:
+        """
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        if default_conn is None:
+            manager = driver.connection_manager(self.sid)
+            conn = manager.connection(did=self.did, conn_id=self.conn_id)
+        else:
+            conn = default_conn
+
+        return save_changed_data(changed_data=changed_data,
+                                 columns_info=columns_info,
+                                 command_obj=self,
+                                 client_primary_key=client_primary_key,
+                                 conn=conn)
+
+    def get_columns_types(self, conn):
+        return _grid_columns_types(self, conn)
+
+
+class ViewCommand(GridCommand):
+    """
+    class ViewCommand(GridCommand)
+
+        It is a derived class for View type.
+    """
+    object_type = 'view'
+
+    def __init__(self, **kwargs):
+        """
+        This method calls the __init__ method of the base class
+        to get the proper object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+
+        # call base class init to fetch the table name
+        super().__init__(**kwargs)
+
+        self._reset_edit_cache()
+
+    def _reset_edit_cache(self):
+        """
+        Cache for the editability check (and the primary key info it
+        resolves along the way). The command object is pickled into the
+        session, so this lives for as long as the grid does; get_sql()
+        clears it so that every data load (initial, refresh, filter or
+        sort) re-checks the view's current definition, and the save path
+        then uses what that load resolved, refusing the save if the
+        view's base table or keys no longer match it. None means "not
+        yet determined".
+        """
+        self._can_edit = None
+        self._base_oid = None
+        self._pk_names = ''
+        self._primary_keys = OrderedDict()
+
+    def get_sql(self, default_conn=None):
+        """
+        This method is used to create a proper SQL query
+        to fetch the data for the specified view
+        """
+        # A new data load: re-check the view's editability and key
+        # columns rather than trusting what an earlier load resolved.
+        self._reset_edit_cache()
+
+        sql_filter = self.get_filter()
+        data_sorting = self.get_data_sorting()
+
+        if sql_filter is None:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                limit=self.limit, data_sorting=data_sorting
+            )
+        else:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                sql_filter=sql_filter, limit=self.limit,
+                data_sorting=data_sorting
+            )
+
+        return sql
+
+    def can_edit(self, default_conn=None):
+        """
+        A view is editable only if PostgreSQL itself classifies it as a
+        simple automatically updatable view (single base table, no
+        INSTEAD OF UPDATE/DELETE/INSERT triggers - a view with any of
+        these is left entirely out of scope, not just the one the
+        triggering operation would use), and the base table's primary key
+        columns are exposed under their original names in the view's own
+        output.
+
+        Args:
+            default_conn: an already-resolved connection to reuse (see
+                sqleditor/__init__.py's start_view_data(), which resolves
+                one specifically so metadata calls like this one don't
+                run on the same conn_id-keyed connection as an in-flight
+                async query and its cursor). Only resolved independently
+                when the caller doesn't supply one.
+
+        This never raises: any missing connection, failed query, or
+        unexpected error is treated as "not editable".
+        """
+        # Use getattr rather than direct attribute access: a ViewCommand
+        # unpickled from a session created before this attribute existed
+        # (see session_obj['command_obj'] in sqleditor/__init__.py) won't
+        # have it, and this must fail closed rather than raise.
+        if getattr(self, '_can_edit', None) is not None:
+            return self._can_edit
+
+        try:
+            driver = get_driver(PG_DEFAULT_DRIVER)
+            if default_conn is None:
+                manager = driver.connection_manager(self.sid)
+                conn = manager.connection(did=self.did,
+                                          conn_id=self.conn_id)
+            else:
+                conn = default_conn
+
+            resolved, info = self._resolve_edit_info(conn)
+            if not resolved:
+                return False
+
+            if info is None:
+                # Not a simple auto-updatable view (join, trigger-backed,
+                # not updatable at all, PK not exposed, etc). Cache it
+                # until the next data load re-checks.
+                self._can_edit = False
+                return self._can_edit
+
+            self._base_oid = info['base_oid']
+            self._pk_names = info['pk_names']
+            self._primary_keys = info['primary_keys']
+            self._can_edit = True
+        except Exception:
+            # Fail closed - never let can_edit() raise, but keep the
+            # cause diagnosable.
+            current_app.logger.debug(
+                'Could not determine whether view %s.%s is editable',
+                self.nsp_name, self.object_name, exc_info=True)
+            return False
+
+        return self._can_edit
+
+    def _resolve_edit_info(self, conn):
+        """
+        Look up, from the view's current definition, the base table it
+        updates and the primary key columns it exposes under their
+        original names.
+
+        Returns (resolved, info): resolved is False if the lookup itself
+        could not be completed (no connection, a failed query), in which
+        case nothing should be cached. Otherwise info is None for a view
+        that is not editable, or a dict with base_oid, pk_names and
+        primary_keys.
+        """
+        driver = get_driver(PG_DEFAULT_DRIVER)
+
+        if not conn.connected():
+            return False, None
+
+        # Resolve the base table backing this view (if any).
+        query = render_template(
+            "/".join([self.sql_path, 'view_base_table.sql']),
+            obj_id=self.obj_id,
+            nsp_name=self.nsp_name,
+            object_name=self.object_name,
+            conn=conn,
+        )
+        status, result = conn.execute_dict(query)
+        if not status:
+            return False, None
+
+        if len(result['rows']) == 0:
+            return True, None
+
+        base_oid = result['rows'][0]['oid']
+        base_nspname = result['rows'][0]['nspname']
+        base_relname = result['rows'][0]['relname']
+
+        # The base table's real primary key columns.
+        pk_query = render_template(
+            "/".join([self.sql_path, 'primary_keys.sql']),
+            table_name=base_relname,
+            table_nspname=base_nspname,
+            conn=conn,
+        )
+        status, pk_result = conn.execute_dict(pk_query)
+        if not status:
+            return False, None
+
+        # The view's own output column names.
+        cols_query = render_template(
+            "/".join([self.sql_path, 'get_columns.sql']),
+            obj_id=self.obj_id,
+            conn=conn,
+        )
+        status, cols_result = conn.execute_dict(cols_query)
+        if not status:
+            return False, None
+
+        view_column_names = {
+            row['attname'] for row in cols_result['rows']
+        }
+
+        # Every primary-key column must also be present, under its
+        # original name, in the view's own output. There is no reliable
+        # way to map a renamed/omitted PK column back to the base table
+        # through aliasing, so such views are deliberately left
+        # non-editable. A view exposing only part of a composite key is
+        # refused too: the partial key does not identify a single base
+        # row, so a save could silently change a different row that
+        # shares it.
+        primary_keys = OrderedDict()
+        for row in pk_result['rows']:
+            if row['attname'] in view_column_names:
+                primary_keys[row['attname']] = row['typname']
+
+        if not primary_keys or len(primary_keys) != len(pk_result['rows']):
+            return True, None
+
+        pk_names = ','.join(
+            driver.qtIdent(conn, col) for col in primary_keys
+        )
+
+        return True, {
+            'base_oid': base_oid,
+            'pk_names': pk_names,
+            'primary_keys': primary_keys,
+        }
+
+    def get_primary_keys(self, default_conn=None):
+        """
+        This function is used to fetch the primary key columns of the
+        view's underlying base table, filtered to the ones the view
+        itself still exposes under their original name. Resolved (and
+        cached) by can_edit(), which is run first if it hasn't been yet -
+        forwarding whatever connection this was given, rather than
+        letting can_edit() resolve one of its own independently of the
+        caller (see can_edit()'s default_conn docstring).
+        """
+        if getattr(self, '_can_edit', None) is None:
+            self.can_edit(default_conn)
+
+        return getattr(self, '_pk_names', ''), \
+            getattr(self, '_primary_keys', OrderedDict())
+
+    def has_oids(self, default_conn=None):
+        """
+        Views cannot have oids in any currently supported PostgreSQL
+        version.
+        """
+        return False
+
+    def save(self,
+             changed_data,
+             columns_info,
+             client_primary_key='__temp_PK',
+             default_conn=None):
+        """
+        This function is used to save the data into the database.
+
+        Args:
+            changed_data: Contains data to be saved
+            columns_info:
+            client_primary_key:
+            default_conn:
+        """
+        # Before this class existed, every view fell through to
+        # GridCommand.save() below, which always refuses. Match that: a
+        # non-editable view (join-based, trigger-backed, matview, PK not
+        # exposed under its own name, etc.) must still be refused here,
+        # not attempted - can_edit() being false isn't otherwise checked
+        # anywhere on this path before a transaction gets started.
+        #
+        # This deliberately does NOT call forbidden() the way
+        # GridCommand.save() does: forbidden() returns a raw HTTP
+        # Response, but the one real caller of this method - the
+        # /sqleditor/save/<trans_id> endpoint - always does
+        # `status, res, query_results, _rowid = trans_obj.save(...)`,
+        # and unpacking a Response that way raises TypeError (verified),
+        # turning a clean refusal into a 500. Same message/intent as
+        # forbidden(), in the 4-tuple shape save_changed_data() itself
+        # already returns for its own early refusals.
+        if not self.can_edit(default_conn):
+            return (
+                False,
+                gettext("Data cannot be saved for the current object."),
+                [],
+                None
+            )
+
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        if default_conn is None:
+            manager = driver.connection_manager(self.sid)
+            conn = manager.connection(did=self.did, conn_id=self.conn_id)
+        else:
+            conn = default_conn
+
+        # The grid's rows, and the keys identifying them, were resolved
+        # when the data was loaded. If the view has since been replaced
+        # (e.g. CREATE OR REPLACE VIEW over a different table, or a
+        # changed primary key), the same keys could now match unrelated
+        # rows, so refuse rather than write through the new definition.
+        resolved, info = self._resolve_edit_info(conn)
+        if not resolved or info is None or \
+                info['base_oid'] != getattr(self, '_base_oid', None) or \
+                info['primary_keys'] != self._primary_keys:
+            return (
+                False,
+                gettext(
+                    'Data cannot be saved because the view has changed '
+                    'since the data was loaded; refresh the data and try '
+                    'again.'
+                ),
+                [],
+                None
+            )
+
+        return save_changed_data(changed_data=changed_data,
+                                 columns_info=columns_info,
+                                 command_obj=self,
+                                 client_primary_key=client_primary_key,
+                                 conn=conn)
+
+    def get_columns_types(self, conn):
+        """
+        Fetch column type/attribute info for the view's own output
+        columns, the same way TableCommand does for a table: for a
+        simple 1:1 view the driver reports every result
+        column's table_oid as the view's own oid (see
+        _check_single_table), so this resolves against the view's own
+        catalog entry exactly like it does for a table.
+        """
+        return _grid_columns_types(self, conn)
+
+    def can_filter(self):
+        return True
+
+    def can_insert(self):
+        # Inserting rows through a view is not supported. The client
+        # uses this to disable "Add row" and "Paste", and
+        # save_changed_data() refuses any added rows regardless.
+        return False
+
+
+class MViewCommand(ViewCommand):
+    """
+    class MViewCommand(ViewCommand)
+
+        It is a derived class for View type has
+        same functionality of View
+    """
+    object_type = 'mview'
+
+
+class ForeignTableCommand(GridCommand):
+    """
+    class ForeignTableCommand(GridCommand)
+
+        It is a derived class for ForeignTable type.
+    """
+    object_type = 'foreign_table'
+
+    def __init__(self, **kwargs):
+        """
+        This method calls the __init__ method of the base class
+        to get the proper object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+
+        # call base class init to fetch the table name
+        super().__init__(**kwargs)
+
+    def get_sql(self, default_conn=None):
+        """
+        This method is used to create a proper SQL query
+        to fetch the data for the specified foreign table
+        """
+        sql_filter = self.get_filter()
+        data_sorting = self.get_data_sorting()
+
+        if sql_filter is None:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                limit=self.limit, data_sorting=data_sorting
+            )
+        else:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                sql_filter=sql_filter, limit=self.limit,
+                data_sorting=data_sorting
+            )
+
+        return sql
+
+    def can_edit(self):
+        return False
+
+    def can_filter(self):
+        return True
+
+
+class CatalogCommand(GridCommand):
+    """
+    class CatalogCommand(GridCommand)
+
+        It is a derived class for CatalogObject type.
+    """
+    object_type = 'catalog_object'
+
+    def __init__(self, **kwargs):
+        """
+        This method calls the __init__ method of the base class
+        to get the proper object name.
+
+        Args:
+            **kwargs : N number of parameters
+        """
+
+        # call base class init to fetch the table name
+        super().__init__(**kwargs)
+
+    def get_sql(self, default_conn=None):
+        """
+        This method is used to create a proper SQL query
+        to fetch the data for the specified catalog object
+        """
+        sql_filter = self.get_filter()
+        data_sorting = self.get_data_sorting()
+
+        if sql_filter is None:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                limit=self.limit, data_sorting=data_sorting
+            )
+        else:
+            sql = render_template(
+                "/".join([self.sql_path, self._OBJECT_QUERY_SQL]),
+                object_name=self.object_name, nsp_name=self.nsp_name,
+                sql_filter=sql_filter, limit=self.limit,
+                data_sorting=data_sorting
+            )
+
+        return sql
+
+    def can_edit(self):
+        return False
+
+    def can_filter(self):
+        return True
+
+
+class QueryToolCommand(BaseCommand, FetchedRowTracker):
+    """
+    class QueryToolCommand(BaseCommand)
+
+        It is a derived class for Query Tool.
+    """
+    object_type = 'query_tool'
+
+    def __init__(self, **kwargs):
+        # call base class init to fetch the table name
+
+        BaseCommand.__init__(self, **kwargs)
+        FetchedRowTracker.__init__(self, **kwargs)
+
+        self.conn_id = kwargs['conn_id'] if 'conn_id' in kwargs else None
+        self.conn_id_ac = kwargs['conn_id_ac'] if 'conn_id_ac' in kwargs\
+            else None
+        self.auto_rollback = False
+        self.auto_commit = True
+
+        # Attributes needed to be able to edit updatable resultsets
+        self.is_updatable_resultset = False
+        self.primary_keys = None
+        self.pk_names = None
+        self.table_has_oids = False
+        self.columns_types = None
+        self.thread_native_id = None
+        self.server_cursor = False
+
+    def get_sql(self, default_conn=None):
+        return None
+
+    def get_all_columns_with_order(self):
+        return None
+
+    def get_primary_keys(self):
+        return self.pk_names, self.primary_keys
+
+    def get_columns_types(self, conn=None):
+        return self.columns_types
+
+    def has_oids(self):
+        return self.table_has_oids
+
+    def can_edit(self):
+        return self.is_updatable_resultset
+
+    def can_filter(self):
+        return False
+
+    def check_updatable_results_pkeys_oids(self):
+        """
+            This function is used to check whether the last successful query
+            produced updatable results and sets the necessary flags and
+            attributes accordingly.
+            Should be called after polling for the results is successful
+            (results are ready)
+        """
+        # Fetch the connection object
+        driver = get_driver(PG_DEFAULT_DRIVER)
+        manager = driver.connection_manager(self.sid)
+        conn = manager.connection(did=self.did, conn_id=self.conn_id)
+
+        # Get the driver version as a float
+        driver_version = float('.'.join(driver.version().split('.')[:2]))
+
+        # Checking for updatable resultsets uses features in psycopg 2.8
+        if driver_version < 2.8:
+            return False
+
+        # Get the path to the sql templates
+        sql_path = 'sqleditor/sql/#{0}#'.format(manager.version)
+
+        self.is_updatable_resultset, self.table_has_oids,\
+            self.primary_keys, pk_names, table_oid,\
+            self.columns_types = is_query_resultset_updatable(conn, sql_path)
+
+        # Create pk_names attribute in the required format
+        if pk_names is not None:
+            self.pk_names = ''
+
+            for pk_name in pk_names:
+                self.pk_names += driver.qtIdent(conn, pk_name) + ','
+
+            if self.pk_names != '':
+                # Remove last character from the string
+                self.pk_names = self.pk_names[:-1]
+
+        # Add attributes required to be able to update table data
+        if self.is_updatable_resultset:
+            self.__set_updatable_results_attrs(sql_path=sql_path,
+                                               table_oid=table_oid,
+                                               conn=conn)
+        return self.is_updatable_resultset
+
+    def save(self,
+             changed_data,
+             columns_info,
+             client_primary_key='__temp_PK',
+             default_conn=None):
+        if not self.is_updatable_resultset:
+            return False, gettext('Resultset is not updatable.'), None, None
+        else:
+            driver = get_driver(PG_DEFAULT_DRIVER)
+            if default_conn is None:
+                manager = driver.connection_manager(self.sid)
+                conn = manager.connection(did=self.did, conn_id=self.conn_id)
+            else:
+                conn = default_conn
+
+            return save_changed_data(changed_data=changed_data,
+                                     columns_info=columns_info,
+                                     conn=conn,
+                                     command_obj=self,
+                                     client_primary_key=client_primary_key,
+                                     auto_commit=self.auto_commit)
+
+    def set_connection_id(self, conn_id):
+        self.conn_id = conn_id
+
+    def set_connection_id_ac(self, conn_id):
+        self.conn_id_ac = conn_id
+
+    def set_auto_rollback(self, auto_rollback):
+        self.auto_rollback = auto_rollback
+
+    def set_auto_commit(self, auto_commit):
+        self.auto_commit = auto_commit
+
+    def set_server_cursor(self, server_cursor):
+        self.server_cursor = server_cursor
+
+    def __set_updatable_results_attrs(self, sql_path,
+                                      table_oid, conn):
+        # Set template path for sql scripts and the table object id
+        self.sql_path = sql_path
+        self.obj_id = table_oid
+
+        if conn.connected():
+            # Fetch the Namespace Name and object Name
+            query = render_template(
+                "/".join([self.sql_path, 'objectname.sql']),
+                obj_id=self.obj_id
+            )
+
+            status, result = conn.execute_dict(query)
+            if not status:
+                raise ExecuteError(result)
+
+            self.nsp_name = result['rows'][0]['nspname']
+            self.object_name = result['rows'][0]['relname']
+        else:
+            raise InternalServerError(SERVER_CONNECTION_CLOSED)
+
+    def get_thread_native_id(self):
+        return self.thread_native_id
+
+    def set_thread_native_id(self, thread_native_id):
+        self.thread_native_id = thread_native_id

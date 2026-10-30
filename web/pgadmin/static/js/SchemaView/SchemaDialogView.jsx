@@ -1,0 +1,311 @@
+/////////////////////////////////////////////////////////////
+//
+// pgAdmin 4 - PostgreSQL Tools
+//
+// Copyright (C) 2013 - 2026, The pgAdmin Development Team
+// This software is released under the PostgreSQL Licence
+//
+//////////////////////////////////////////////////////////////
+
+import { useState, useEffect, useMemo } from 'react';
+
+import CloseIcon from '@mui/icons-material/Close';
+import DoneIcon from '@mui/icons-material/Done';
+import InfoIcon from '@mui/icons-material/InfoRounded';
+import HelpIcon from '@mui/icons-material/HelpRounded';
+import PublishIcon from '@mui/icons-material/Publish';
+import SaveIcon from '@mui/icons-material/Save';
+import SettingsBackupRestoreIcon from '@mui/icons-material/SettingsBackupRestore';
+import { Box } from '@mui/material';
+import _ from 'lodash';
+import PropTypes from 'prop-types';
+
+import { parseApiError } from 'sources/api_instance';
+import { usePgAdmin } from 'sources/PgAdminProvider';
+import { useIsMounted } from 'sources/custom_hooks';
+import { DefaultButton, PgIconButton } from 'sources/components/Buttons';
+import CustomPropTypes from 'sources/custom_prop_types';
+import gettext from 'sources/gettext';
+
+import { FormLoader } from './FormLoader';
+import FormView from './FormView';
+import { ResetButton } from './ResetButton';
+import { SaveButton } from './SaveButton';
+import { SchemaStateContext } from './SchemaState';
+import { StyledBox } from './StyledComponents';
+import { useSchemaState } from './hooks';
+import { getForQueryParams } from './common';
+import { QueryToolIcon } from '../components/ExternalIcon';
+import TerminalRoundedIcon from '@mui/icons-material/TerminalRounded';
+import { WORKSPACES } from '../../../browser/static/js/constants';
+
+
+/* If its the dialog */
+export default function SchemaDialogView({
+  getInitData, viewHelperProps, loadingText, schema={}, showFooter=true,
+  isTabView=true, checkDirtyOnEnableSave=false, customCloseBtnName=gettext('Close'), focusOnFirstInput=true,
+  ...props
+}) {
+  // View helper properties
+  const onDataChange  = props.onDataChange;
+  const [resetKey, setResetKey] = useState(0);
+
+  // Schema data state manager
+  const {schemaState, dataDispatch, reset} = useSchemaState({
+    schema: schema, getInitData: getInitData, immutableData: {},
+    viewHelperProps: viewHelperProps, onDataChange: onDataChange,
+    loadingText,
+  });
+
+  const resetView = () => {
+    reset();
+    setResetKey(Date.now());
+  };
+
+  // Is saving operation in progress?
+  const setSaving = (val) => schemaState.isSaving = val;
+  const setLoaderText = (val) => schemaState.setMessage(val);
+
+  // First element to be set by the FormView to set the focus after loading
+  // the data.
+  const checkIsMounted = useIsMounted();
+
+  // Notifier object.
+  const pgAdmin = usePgAdmin();
+  const Notifier = props.Notifier || pgAdmin.Browser.notifier;
+
+  useEffect(() => {
+    if (!props.resetKey) return;
+    resetView();
+  }, [props.resetKey]);
+
+  const onResetClick = () => {
+    const resetIt = () => {
+      resetView();
+      return true;
+    };
+
+    if (!props.confirmOnCloseReset) {
+      resetIt();
+      return;
+    }
+
+    Notifier.confirm(
+      gettext('Warning'),
+      gettext('Changes will be lost. Are you sure you want to reset?'),
+      resetIt, () => (true),
+    );
+  };
+
+  const save = (changeData, onSaved) => {
+    props.onSave(schemaState.isNew, changeData)
+      .then(()=>{
+        if(schema.informText) {
+          Notifier.alert(
+            gettext('Warning'),
+            schema.informText,
+          );
+        }
+        onSaved?.();
+      }).catch((err)=>{
+        schemaState.setError({
+          name: 'apierror',
+          message: _.escape(parseApiError(err)),
+        });
+      }).finally(()=>{
+        if(checkIsMounted()) {
+          setSaving(false);
+          setLoaderText('');
+        }
+      });
+  };
+
+  // closeOnSave is only ever passed explicitly as true, by the Ctrl/Cmd+Enter
+  // handler below. The Save button's onClick passes its click event instead,
+  // which is never === true, so a plain Save click keeps its existing
+  // behaviour (some dialogs, e.g. object properties, stay open after Save).
+  const onSaveClick = (closeOnSave) => {
+    // Do nothing when a save is already in flight, when there is no change,
+    // or when there is an error. The Save button is disabled whilst saving,
+    // but the Ctrl/Cmd+Enter shortcut calls this directly.
+    if (schemaState.isSaving) return;
+    if (
+      !schemaState._changes || Object.keys(schemaState._changes).length === 0 ||
+      schemaState.errors.name
+    ) return;
+
+    setSaving(true);
+    setLoaderText(schemaState.customLoadingText || gettext('Saving...'));
+
+    const onSaved = closeOnSave === true ? () => props.onClose?.() : undefined;
+
+    if (!schema.warningText) {
+      save(schemaState.changes(true), onSaved);
+      return;
+    }
+
+    Notifier.confirm(
+      gettext('Warning'),
+      schema.warningText,
+      () => { save(schemaState.changes(true), onSaved); },
+      () => {
+        setSaving(false);
+        setLoaderText('');
+        return true;
+      },
+    );
+  };
+
+  const getSQLValue = () => {
+    // Called when SQL tab is active.
+    if(!schemaState.isDirty) {
+      return Promise.resolve('-- ' + gettext('No updates.'));
+    }
+
+    if(schemaState.errors.name) {
+      return Promise.resolve('-- ' + gettext('Definition incomplete.'));
+    }
+
+    const changeData = schemaState._changes;
+    /*
+     * Call the passed incoming getSQLValue func to get the SQL
+     * return of getSQLValue should be a promise.
+     */
+    return props.getSQLValue(schemaState.isNew, getForQueryParams(changeData));
+  };
+
+  const getButtonIcon = () => {
+    if(props.customSaveBtnIconType == 'upload') {
+      return <PublishIcon />;
+    } else if(props.customSaveBtnIconType == 'done') {
+      return <DoneIcon />;
+    } else if(props.customSaveBtnIconType == WORKSPACES.QUERY_TOOL) {
+      return <QueryToolIcon />;
+    } else if(props.customSaveBtnIconType == WORKSPACES.PSQL_TOOL) {
+      return <TerminalRoundedIcon style={{width:'unset'}}/>;
+    }
+    return <SaveIcon />;
+  };
+
+  const onKeyDown = (e) => {
+    // Ctrl/Cmd+Enter saves and closes the dialog from anywhere within it
+    // (issue #7167). onSaveClick is a no-op when there is nothing to save or
+    // there is a validation error, so this is safe to call unconditionally.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key === 'Enter') {
+      e.preventDefault();
+      onSaveClick(true);
+      return;
+    }
+
+    // Escape closes the dialog, mirroring the Close button (issue #5691).
+    // This is needed for dialogs rendered as dockable panels (Properties,
+    // Backup, and other utility dialogs); dialogs rendered inside a MUI modal
+    // already close on Escape, so skip those to avoid a double close. The
+    // !e.defaultPrevented guard lets an inner control that handles Escape
+    // (e.g. an open dropdown) consume it first.
+    if (e.key === 'Escape' && !e.defaultPrevented && props.onClose &&
+        !e.currentTarget.closest('.MuiDialog-root')) {
+      e.preventDefault();
+      props.onClose();
+    }
+  };
+
+  /* I am Groot */
+  // Only the children are memoized: the wrapper carries onKeyDown, which
+  // closes over props.onClose and onSaveClick, and memoizing it would pin
+  // whichever versions of those existed when the deps last changed.
+  const dialogContent = useMemo(() =>
+    <>
+      <SchemaStateContext.Provider value={schemaState}>
+        <Box className='Dialog-form'>
+          <FormLoader/>
+          <FormView key={resetKey}
+            viewHelperProps={viewHelperProps}
+            schema={schema} accessPath={[]}
+            dataDispatch={dataDispatch}
+            hasSQLTab={props.hasSQL} getSQLValue={getSQLValue}
+            isTabView={isTabView}
+            className={props.formClassName}
+            showError={true} resetKey={resetKey}
+            focusOnFirstInput={focusOnFirstInput}
+          />
+        </Box>
+        {showFooter &&
+          <Box className='Dialog-footer'>
+            {
+              (!props.disableSqlHelp || !props.disableDialogHelp) &&
+                <Box>
+                  <PgIconButton data-test='sql-help'
+                    onClick={()=>props.onHelp(true, schemaState.isNew)}
+                    icon={<InfoIcon />} disabled={props.disableSqlHelp}
+                    className='Dialog-buttonMargin'
+                    title={ gettext('SQL help for this object type.') }
+                  />
+                  <PgIconButton data-test='dialog-help'
+                    onClick={()=>props.onHelp(false, schemaState.isNew)}
+                    icon={<HelpIcon />} disabled={props.disableDialogHelp}
+                    title={ gettext('Help for this dialog.') }
+                  />
+                </Box>
+            }
+            <Box marginLeft='auto'>
+              {
+                Boolean(customCloseBtnName) &&
+                  <DefaultButton data-test='Close' onClick={props.onClose}
+                    startIcon={<CloseIcon />} className='Dialog-buttonMargin'>
+                    { customCloseBtnName }
+                  </DefaultButton>
+              }
+              <ResetButton
+                onClick={onResetClick}
+                icon={<SettingsBackupRestoreIcon />}
+                label={ gettext('Reset') }/>
+              <SaveButton
+                onClick={onSaveClick} icon={getButtonIcon()}
+                label={props.customSaveBtnName || gettext('Save')}
+                checkDirtyOnEnableSave={checkDirtyOnEnableSave}
+                mode={viewHelperProps.mode}
+              />
+            </Box>
+          </Box>
+        }
+      </SchemaStateContext.Provider>
+    </>, [schema._id, viewHelperProps.mode, resetKey]
+  );
+
+  return <StyledBox onKeyDown={onKeyDown}>{dialogContent}</StyledBox>;
+}
+
+SchemaDialogView.propTypes = {
+  getInitData: PropTypes.func,
+  viewHelperProps: PropTypes.shape({
+    mode: PropTypes.string.isRequired,
+    serverInfo: PropTypes.shape({
+      type: PropTypes.string,
+      version: PropTypes.number,
+    }),
+    inCatalog: PropTypes.bool,
+    keepCid: PropTypes.bool,
+  }).isRequired,
+  loadingText: PropTypes.string,
+  schema: CustomPropTypes.schemaUI,
+  onSave: PropTypes.func,
+  onClose: PropTypes.func,
+  onHelp: PropTypes.func,
+  onDataChange: PropTypes.func,
+  confirmOnCloseReset: PropTypes.bool,
+  isTabView: PropTypes.bool,
+  hasSQL: PropTypes.bool,
+  getSQLValue: PropTypes.func,
+  disableSqlHelp: PropTypes.bool,
+  disableDialogHelp: PropTypes.bool,
+  showFooter: PropTypes.bool,
+  resetKey: PropTypes.any,
+  customSaveBtnName: PropTypes.string,
+  customSaveBtnIconType: PropTypes.string,
+  formClassName: CustomPropTypes.className,
+  Notifier: PropTypes.object,
+  checkDirtyOnEnableSave: PropTypes.bool,
+  customCloseBtnName: PropTypes.string,
+  focusOnFirstInput: PropTypes.bool,
+};
